@@ -8,3 +8,5 @@
 *.order
 
 compile_commands.json
+disk
+rw

@@ -186,16 +186,13 @@ switch_region_table_write(struct switch_ctx *sctx, unsigned long region_nr, unsi
 }
 
 /*
- * Fill the region table with an initial round robin pattern.
+ * Initially route all I/O to path 0
  */
 static void initialise_region_table(struct switch_ctx *sctx) {
-    unsigned path_nr = 0;
     unsigned long region_nr;
 
     for (region_nr = 0; region_nr < sctx->nr_regions; region_nr++) {
-        switch_region_table_write(sctx, region_nr, path_nr);
-        if (++path_nr >= sctx->nr_paths)
-            path_nr = 0;
+        switch_region_table_write(sctx, region_nr, 0);
     }
 }
 
@@ -286,9 +283,10 @@ static int switch_ctr(struct dm_target *ti, unsigned argc, char **argv) {
         return -ENOMEM;
     }
 
-    r = dm_set_target_max_io_len(ti, region_size);
-    if (r)
-        goto error;
+    // emux wishes to have a complete of a bio
+    // r = dm_set_target_max_io_len(ti, region_size);
+    // if (r)
+    //     goto error;
 
     while (as.argc) {
         r = parse_path(&as, ti);
@@ -320,6 +318,12 @@ static int switch_map(struct dm_target *ti, struct bio *bio) {
 
     bio_set_dev(bio, sctx->path_list[path_nr].dmdev->bdev);
     bio->bi_iter.bi_sector = sctx->path_list[path_nr].start + offset;
+
+    DMINFO("%s: op= 0x%x offset= 0x%llx size= 0x%x",
+           __func__,
+           bio->bi_opf,
+           bio->bi_iter.bi_sector * 512,
+           bio->bi_iter.bi_size);
 
     return DM_MAPIO_REMAPPED;
 }
