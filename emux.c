@@ -16,10 +16,32 @@
 
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/spinlock.h>
 #include <linux/vmalloc.h>
 
 #define MODULE_NAME   "emux"
 #define DM_MSG_PREFIX MODULE_NAME
+
+enum emux_page_state {
+    EMUX_PAGE_UNCACHED = 0,
+    EMUX_PAGE_PENDING,
+    EMUX_PAGE_PROMOTING,
+    EMUX_PAGE_CACHED,
+};
+
+struct emux_page {
+    spinlock_t lock;
+    enum emux_page_state state;
+    u64 write_ts;
+};
+
+struct emux_ctx {
+    u64 page_sectors;  // Page size in sectors, e.g. 8 for 4k page size
+    u64 num_pages;
+
+    // Page metadata
+    struct emux_page pages[];
+};
 
 /*
  * One region_table_slot_t holds <region_entries_per_slot> region table
@@ -40,6 +62,8 @@ struct switch_path {
  */
 struct switch_ctx {
     struct dm_target *ti;
+
+    struct emux_ctx *emux;
 
     unsigned nr_paths; /* Number of paths in path_list. */
 
@@ -231,6 +255,7 @@ static void switch_dtr(struct dm_target *ti) {
         dm_put_device(ti, sctx->path_list[sctx->nr_paths].dmdev);
 
     vfree(sctx->region_table);
+    vfree(sctx->emux);
     kfree(sctx);
 }
 
@@ -255,6 +280,9 @@ static int switch_ctr(struct dm_target *ti, unsigned argc, char **argv) {
     struct dm_arg_set as;
     unsigned nr_paths, region_size, nr_optional_args;
     int r;
+
+    struct emux_ctx *emux;
+    u64 num_pages, i;
 
     as.argc = argc;
     as.argv = argv;
@@ -283,10 +311,25 @@ static int switch_ctr(struct dm_target *ti, unsigned argc, char **argv) {
         return -ENOMEM;
     }
 
-    // emux wishes to have a complete of a bio
-    // r = dm_set_target_max_io_len(ti, region_size);
-    // if (r)
-    //     goto error;
+    r = dm_set_target_max_io_len(ti, region_size);
+    if (r)
+        goto error;
+
+    num_pages = DIV_ROUND_UP(ti->len, region_size);
+    emux = vzalloc(struct_size(emux, pages, num_pages));
+    if (!emux) {
+        ti->error = "Cannot allocate emux context";
+        return -ENOMEM;
+    }
+
+    emux->page_sectors = region_size;
+    emux->num_pages = num_pages;
+    for (i = 0; i < num_pages; i++) {
+        spin_lock_init(&emux->pages[i].lock);
+    }
+
+    sctx->emux = emux;
+    DMINFO("Allocated metadata for %llu pages", emux->num_pages);
 
     while (as.argc) {
         r = parse_path(&as, ti);
@@ -319,11 +362,11 @@ static int switch_map(struct dm_target *ti, struct bio *bio) {
     bio_set_dev(bio, sctx->path_list[path_nr].dmdev->bdev);
     bio->bi_iter.bi_sector = sctx->path_list[path_nr].start + offset;
 
-    DMINFO("%s: op= 0x%x offset= 0x%llx size= 0x%x",
-           __func__,
-           bio->bi_opf,
-           bio->bi_iter.bi_sector * 512,
-           bio->bi_iter.bi_size);
+    // DMINFO("%s: op= 0x%x offset= 0x%llx size= 0x%x",
+    //        __func__,
+    //        bio->bi_opf,
+    //        bio->bi_iter.bi_sector * 512,
+    //        bio->bi_iter.bi_size);
 
     return DM_MAPIO_REMAPPED;
 }
