@@ -86,8 +86,9 @@ struct emux_ctx {
     struct emux_page pages[];
 };
 
-static u64 emux_handle_mark(struct emux_ctx *emux, u64 *ids, u64 count) {
-    u64 marked = 0, i, id;
+static u64
+emux_handle_mark_or_reclaim(struct emux_ctx *emux, u64 *ids, u64 count, enum emux_ioctl_op op) {
+    u64 performed = 0, i, id;
     struct emux_page *page;
 
     for (i = 0; i < count; i++) {
@@ -97,87 +98,65 @@ static u64 emux_handle_mark(struct emux_ctx *emux, u64 *ids, u64 count) {
 
         page = &emux->pages[id];
         mutex_lock(&page->mutex);
-        if (page->state == EMUX_PAGE_UNCACHED) {
-            emux_set_page_state(page, EMUX_PAGE_PENDING);
-            marked++;
+
+        switch (op) {
+            case EMUX_IOCTL_MARK: {
+                if (page->state == EMUX_PAGE_UNCACHED) {
+                    emux_set_page_state(page, EMUX_PAGE_PENDING);
+                }
+            } break;
+
+            case EMUX_IOCTL_RECLAIM: {
+                if (page->state != EMUX_PAGE_UNCACHED) {
+                    emux_set_page_state(page, EMUX_PAGE_UNCACHED);
+                    page->version++;
+                }
+            }
         }
+
         mutex_unlock(&page->mutex);
+
+        performed++;
     }
 
-    return marked;
-}
-
-static u64 emux_handle_reclaim(struct emux_ctx *emux, u64 *ids, u64 count) {
-    u64 reclaimed = 0, i, id;
-    struct emux_page *page;
-
-    for (i = 0; i < count; i++) {
-        id = ids[i];
-        if (id > emux->num_pages)
-            continue;
-
-        page = &emux->pages[id];
-
-        mutex_lock(&page->mutex);
-        if (page->state != EMUX_PAGE_UNCACHED) {
-            emux_set_page_state(page, EMUX_PAGE_UNCACHED);
-            page->version++;
-            reclaimed++;
-        }
-        mutex_unlock(&page->mutex);
-    }
-
-    return reclaimed;
+    return performed;
 }
 
 static int emux_handle_ioctl(struct emux_ctx *emux, struct emux_ioctl *__user uargs) {
     struct emux_ioctl args;
-    u64 max_count;
     u64 *ids;
     int ret = 0;
 
     if (copy_from_user(&args, uargs, sizeof(args)))
         return -EFAULT;
-    if (args.marked != 0 || args.reclaimed != 0)
+    switch (args.op) {
+        case EMUX_IOCTL_MARK:
+        case EMUX_IOCTL_RECLAIM: break;
+
+        default: return -EINVAL;
+    }
+    if (args.count > EMUX_IOCTL_MAX_COUNT)
+        return -EINVAL;
+    if (args.performed != 0)
         return -EINVAL;
 
-    max_count = max(args.num_to_mark, args.num_to_reclaim);
-    if (max_count == 0)
+    if (args.count == 0)
         return 0;
-    if (max_count > EMUX_MAX_NUM_IDS)
-        return -EINVAL;
 
-    ids = vcalloc(max_count, sizeof(ids[0]));
+    ids = vcalloc(args.count, sizeof(ids[0]));
     if (!ids)
         return -ENOMEM;
 
-    if (args.num_to_mark > 0) {
-        if (copy_from_user(ids, args.mark_ids, array_size(args.num_to_mark, sizeof(ids[0])))) {
-            ret = -EFAULT;
-            goto err;
-        }
-
-        args.marked = emux_handle_mark(emux, ids, args.num_to_mark);
-
-        if (copy_to_user(&uargs->marked, &args.marked, sizeof(args.marked))) {
-            ret = -EFAULT;
-            goto err;
-        }
+    if (copy_from_user(ids, args.ids, array_size(args.count, sizeof(ids[0])))) {
+        ret = -EFAULT;
+        goto err;
     }
 
-    if (args.num_to_reclaim > 0) {
-        if (copy_from_user(
-                ids, args.reclaim_ids, array_size(args.num_to_reclaim, sizeof(ids[0])))) {
-            ret = -EFAULT;
-            goto err;
-        }
+    args.performed = emux_handle_mark_or_reclaim(emux, ids, args.count, args.op);
 
-        args.reclaimed = emux_handle_reclaim(emux, ids, args.num_to_reclaim);
-
-        if (copy_to_user(&uargs->reclaimed, &args.reclaimed, sizeof(args.reclaimed))) {
-            ret = -EFAULT;
-            goto err;
-        }
+    if (copy_to_user(&uargs->performed, &args.performed, sizeof(args.performed))) {
+        ret = -EFAULT;
+        goto err;
     }
 
 err:
