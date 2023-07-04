@@ -93,9 +93,10 @@ int main(int argc, char *argv[]) {
             ctl.ids = ids;
 
             int ret = ioctl(fd, EMUX_IOCTL, &ctl);
-            if (ret < 0) {
+            if (ret < 0)
                 fprintf(stderr, "Cannot perform ioctl: errno=%d\n", errno);
-            }
+            else
+                printf("#performed= %llu\n", ctl.performed);
 
             delete[] ids;
         }

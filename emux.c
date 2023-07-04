@@ -21,10 +21,11 @@
 
 #include "ioctl.h"
 
-#define MODULE_NAME   "emux"
-#define DM_MSG_PREFIX MODULE_NAME
-#define LOWER_DEVICE  0
-#define UPPER_DEVICE  1
+#define MODULE_NAME      "emux"
+#define DM_MSG_PREFIX    MODULE_NAME
+#define LOWER_DEVICE     0
+#define UPPER_DEVICE     1
+#define NUM_RESERVED_BIO 128
 
 /*
  * A device with the offset to its start sector.
@@ -84,6 +85,30 @@ struct emux_ctx {
 
     // Page metadata
     struct emux_page pages[];
+};
+
+struct emux_promotion {
+    void *old_bi_private;
+    bio_end_io_t *old_bi_end_io;
+    struct emux_ctx *emux;
+    struct emux_page *page;
+    u32 version;
+    struct bvec_iter old_bi_iter;
+};
+
+/*
+ * Context block for a dm switch device.
+ */
+struct switch_ctx {
+    struct dm_target *ti;
+    unsigned nr_paths; /* Number of paths in path_list. */
+
+    struct emux_ctx *emux;
+
+    /*
+	 * Array of dm devices to switch between.
+	 */
+    struct switch_path path_list[];
 };
 
 static u64
@@ -190,7 +215,7 @@ static struct emux_ctx *emux_alloc_ctx(u64 page_sectors, u64 num_pages, struct s
     if (!emux)
         goto err_alloc_ctx;
 
-    if (bioset_init(&emux->bioset, BIO_POOL_SIZE, 0, 0))
+    if (bioset_init(&emux->bioset, NUM_RESERVED_BIO, 0, BIOSET_NEED_BVECS | BIOSET_PERCPU_CACHE))
         goto err_bioset_init;
 
     emux->page_sectors = page_sectors;
@@ -214,29 +239,6 @@ static void emux_free_ctx(struct emux_ctx *emux) {
     bioset_exit(&emux->bioset);
     vfree(emux);
 }
-
-struct emux_promotion {
-    void *old_bi_private;
-    bio_end_io_t *old_bi_end_io;
-    struct emux_ctx *emux;
-    struct emux_page *page;
-    u32 version;
-};
-
-/*
- * Context block for a dm switch device.
- */
-struct switch_ctx {
-    struct dm_target *ti;
-    unsigned nr_paths; /* Number of paths in path_list. */
-
-    struct emux_ctx *emux;
-
-    /*
-	 * Array of dm devices to switch between.
-	 */
-    struct switch_path path_list[];
-};
 
 static struct switch_ctx *alloc_switch_ctx(struct dm_target *ti, unsigned nr_paths) {
     struct switch_ctx *sctx;
@@ -409,50 +411,84 @@ static void emux_clone_and_map_bio(struct emux_ctx *emux, struct bio *bio) {
     submit_bio(new_bio);
 }
 
+static __always_unused void emux_print_iter(const char *name, struct bvec_iter iter) {
+    DMINFO("%s={sector=%llu, size=%u, idx=%u, done=%u}",
+           name,
+           iter.bi_sector,
+           iter.bi_size,
+           iter.bi_idx,
+           iter.bi_bvec_done);
+}
+
 static void emux_promotion_done(struct bio *bio) {
+    emux_print_iter(__func__, bio->bi_iter);
+    DMINFO("%s: status=%d", __func__, bio->bi_status);
     bio_free_pages(bio);
 }
 
-static bool emux_start_promotion(struct emux_ctx *emux, struct bio *bio) {
-    u32 vcnt = bio_segments(bio);
+static bool _emux_start_promotion(struct emux_ctx *emux, struct bio *completed_bio) {
+    u32 vcnt = bio_segments(completed_bio);
     struct bio *new_bio;
     struct bvec_iter iter;
     struct bio_vec bv;
     struct page *page;
 
-    BUG_ON(bio_op(bio) != REQ_OP_READ);
+    BUG_ON(bio_op(completed_bio) != REQ_OP_READ);
+    DMINFO("%s: vcnt= %u", __func__, vcnt);
 
     new_bio = bio_alloc_bioset(NULL, vcnt, REQ_OP_WRITE, GFP_NOIO, &emux->bioset);
-    goto err_bio_alloc;
+    if (!new_bio)
+        goto err_bio_alloc;
 
-    bio_for_each_segment(bv, bio, iter) {
+    bio_for_each_segment(bv, completed_bio, iter) {
         page = alloc_pages(GFP_NOIO, get_order(bv.bv_len));
         if (!page)
             goto err_alloc_pages;
 
-        bio_add_page(bio, page, bv.bv_len, 0);
+        DMINFO("%s: bv_len=%u", __func__, bv.bv_len);
+        bio_add_page(new_bio, page, bv.bv_len, 0);
     }
 
-    bio_copy_data(new_bio, bio);
-    emux_map_bio(emux, bio, UPPER_DEVICE);
+    bio_copy_data(new_bio, completed_bio);
+    emux_print_iter("new_bio", new_bio->bi_iter);
+    emux_map_bio(emux, new_bio, UPPER_DEVICE);
+    new_bio->bi_iter.bi_sector = completed_bio->bi_iter.bi_sector;
     new_bio->bi_end_io = emux_promotion_done;
     submit_bio(new_bio);
     return true;
 
 err_alloc_pages:
     bio_free_pages(new_bio);
-    bio_put(bio);
+    bio_put(new_bio);
 err_bio_alloc:
     return false;
 }
 
-static void emux_promote(struct bio *bio) {
-    struct emux_promotion *promote = bio->bi_private;
+static bool
+emux_start_promotion(struct emux_ctx *emux, struct bio *completed_bio, struct bvec_iter old_iter) {
+    struct bvec_iter backup_iter;
+    bool ret;
+
+    // We have to restore the original iterator to read the data from the completed bio
+    backup_iter = completed_bio->bi_iter;
+    emux_print_iter("old", old_iter);
+    emux_print_iter("backup", backup_iter);
+    old_iter.bi_size = old_iter.bi_size - backup_iter.bi_size;
+    completed_bio->bi_iter = old_iter;
+
+    ret = _emux_start_promotion(emux, completed_bio);
+
+    completed_bio->bi_iter = backup_iter;
+    return ret;
+}
+
+static void emux_promote(struct bio *completed_bio) {
+    struct emux_promotion *promote = completed_bio->bi_private;
     struct emux_page *page = promote->page;
 
     mutex_lock(&page->mutex);
     if (page->version == promote->version && page->state == EMUX_PAGE_PROMOTING) {
-        if (emux_start_promotion(promote->emux, bio)) {
+        if (emux_start_promotion(promote->emux, completed_bio, promote->old_bi_iter)) {
             emux_set_page_state(page, EMUX_PAGE_CACHED);
         } else {
             // Promotion of this time is failed. Maybe the next time will succeed
@@ -461,11 +497,11 @@ static void emux_promote(struct bio *bio) {
     }
     mutex_unlock(&page->mutex);
 
-    bio->bi_private = promote->old_bi_private;
-    bio->bi_end_io = promote->old_bi_end_io;
+    completed_bio->bi_private = promote->old_bi_private;
+    completed_bio->bi_end_io = promote->old_bi_end_io;
     kfree(promote);
 
-    bio->bi_end_io(bio);
+    completed_bio->bi_end_io(completed_bio);
 }
 
 static bool
@@ -479,6 +515,7 @@ emux_wrap_bio_with_promotion(struct emux_ctx *emux, struct bio *bio, struct emux
     promote->emux = emux;
     promote->page = page;
     promote->version = page->version;
+    promote->old_bi_iter = bio->bi_iter;
 
     bio->bi_private = promote;
     bio->bi_end_io = emux_promote;
@@ -531,19 +568,28 @@ static int emux_map(struct emux_ctx *emux, struct bio *bio) {
     enum req_op op = bio_op(bio);
     int ret;
 
-    DMINFO("op= %d offset= 0x%llx page #%llu", op, offset * SECTOR_SIZE, page_id);
-
     switch (op) {
         case REQ_OP_READ:
         case REQ_OP_WRITE:
         case REQ_OP_WRITE_ZEROES: {
             mutex_lock(&page->mutex);
+
+            DMINFO("op= %d offset= 0x%llx size=%u page #%llu \"%s\"",
+                   op,
+                   offset * SECTOR_SIZE,
+                   bio->bi_iter.bi_size,
+                   page_id,
+                   emux_page_state_name[page->state]);
+
             ret = emux_map_rw_locked(emux, bio, page, bio_data_dir(bio));
+
             mutex_unlock(&page->mutex);
         } break;
 
         // All other operations are mapped to lower device
         default: {
+            DMINFO("unexpected op= %d offset= 0x%llx", op, offset * SECTOR_SIZE);
+
             emux_map_bio(emux, bio, LOWER_DEVICE);
             ret = DM_MAPIO_REMAPPED;
         }
