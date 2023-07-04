@@ -16,38 +16,15 @@
 
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/vmalloc.h>
+
+#include "ioctl.h"
 
 #define MODULE_NAME   "emux"
 #define DM_MSG_PREFIX MODULE_NAME
-
-enum emux_page_state {
-    EMUX_PAGE_UNCACHED = 0,
-    EMUX_PAGE_PENDING,
-    EMUX_PAGE_PROMOTING,
-    EMUX_PAGE_CACHED,
-};
-
-struct emux_page {
-    spinlock_t lock;
-    enum emux_page_state state;
-    u64 write_ts;
-};
-
-struct emux_ctx {
-    u64 page_sectors;  // Page size in sectors, e.g. 8 for 4k page size
-    u64 num_pages;
-
-    // Page metadata
-    struct emux_page pages[];
-};
-
-/*
- * One region_table_slot_t holds <region_entries_per_slot> region table
- * entries each of which is <region_table_entry_bits> in size.
- */
-typedef unsigned long region_table_slot_t;
+#define LOWER_DEVICE  0
+#define UPPER_DEVICE  1
 
 /*
  * A device with the offset to its start sector.
@@ -56,6 +33,222 @@ struct switch_path {
     struct dm_dev *dmdev;
     sector_t start;
 };
+
+enum emux_page_state {
+    EMUX_PAGE_UNCACHED = 0,
+    EMUX_PAGE_PENDING,
+    EMUX_PAGE_PROMOTING,
+    EMUX_PAGE_CACHED,
+};
+
+static const char *emux_page_state_name[] = {
+    [EMUX_PAGE_UNCACHED] = "uncached",
+    [EMUX_PAGE_PENDING] = "pending",
+    [EMUX_PAGE_PROMOTING] = "promoting",
+    [EMUX_PAGE_CACHED] = "cached",
+};
+
+struct emux_page {
+    struct mutex mutex;
+    union {
+        const enum emux_page_state state;
+        enum emux_page_state __state_writable;
+    };
+    u32 version;
+    u64 id;
+    u8 pad[16];  // Align to 64 bytes, i.e. one cache line
+};
+
+// We use a wrapper function to ease debug logging
+static __always_inline void emux_set_page_state(struct emux_page *page,
+                                                enum emux_page_state state) {
+    DMINFO("page #%llu (v%u): \"%s\" -> \"%s\"",
+           page->id,
+           page->version,
+           emux_page_state_name[page->state],
+           emux_page_state_name[state]);
+    page->__state_writable = state;
+}
+
+struct emux_ctx {
+    u64 page_sectors;  // Page size in sectors, e.g. 8 for 4k page size
+    u64 num_pages;
+    struct switch_path *paths;
+    struct bio_set bioset;
+
+    // Device mapper does not provide callback for ioctl. It only allows dm targets
+    // to redirect a ioctl request to an underlying block device. Therefore we use a
+    // fake block device to receive the ioctl request. This method does not modify
+    // device mapper source code.
+    struct block_device fake_dev;
+
+    // Page metadata
+    struct emux_page pages[];
+};
+
+static u64 emux_handle_mark(struct emux_ctx *emux, u64 *ids, u64 count) {
+    u64 marked = 0, i, id;
+    struct emux_page *page;
+
+    for (i = 0; i < count; i++) {
+        id = ids[i];
+        if (id > emux->num_pages)
+            continue;
+
+        page = &emux->pages[id];
+        mutex_lock(&page->mutex);
+        if (page->state == EMUX_PAGE_UNCACHED) {
+            emux_set_page_state(page, EMUX_PAGE_PENDING);
+            marked++;
+        }
+        mutex_unlock(&page->mutex);
+    }
+
+    return marked;
+}
+
+static u64 emux_handle_reclaim(struct emux_ctx *emux, u64 *ids, u64 count) {
+    u64 reclaimed = 0, i, id;
+    struct emux_page *page;
+
+    for (i = 0; i < count; i++) {
+        id = ids[i];
+        if (id > emux->num_pages)
+            continue;
+
+        page = &emux->pages[id];
+
+        mutex_lock(&page->mutex);
+        if (page->state != EMUX_PAGE_UNCACHED) {
+            emux_set_page_state(page, EMUX_PAGE_UNCACHED);
+            page->version++;
+            reclaimed++;
+        }
+        mutex_unlock(&page->mutex);
+    }
+
+    return reclaimed;
+}
+
+static int emux_handle_ioctl(struct emux_ctx *emux, struct emux_ioctl *__user uargs) {
+    struct emux_ioctl args;
+    u64 max_count;
+    u64 *ids;
+    int ret = 0;
+
+    if (copy_from_user(&args, uargs, sizeof(args)))
+        return -EFAULT;
+    if (args.marked != 0 || args.reclaimed != 0)
+        return -EINVAL;
+
+    max_count = max(args.num_to_mark, args.num_to_reclaim);
+    if (max_count == 0)
+        return 0;
+    if (max_count > EMUX_MAX_NUM_IDS)
+        return -EINVAL;
+
+    ids = vcalloc(max_count, sizeof(ids[0]));
+    if (!ids)
+        return -ENOMEM;
+
+    if (args.num_to_mark > 0) {
+        if (copy_from_user(ids, args.mark_ids, array_size(args.num_to_mark, sizeof(ids[0])))) {
+            ret = -EFAULT;
+            goto err;
+        }
+
+        args.marked = emux_handle_mark(emux, ids, args.num_to_mark);
+
+        if (copy_to_user(&uargs->marked, &args.marked, sizeof(args.marked))) {
+            ret = -EFAULT;
+            goto err;
+        }
+    }
+
+    if (args.num_to_reclaim > 0) {
+        if (copy_from_user(
+                ids, args.reclaim_ids, array_size(args.num_to_reclaim, sizeof(ids[0])))) {
+            ret = -EFAULT;
+            goto err;
+        }
+
+        args.reclaimed = emux_handle_reclaim(emux, ids, args.num_to_reclaim);
+
+        if (copy_to_user(&uargs->reclaimed, &args.reclaimed, sizeof(args.reclaimed))) {
+            ret = -EFAULT;
+            goto err;
+        }
+    }
+
+err:
+    vfree(ids);
+    return ret;
+}
+
+static int emux_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd, unsigned long arg) {
+    struct emux_ctx *emux = container_of(bdev, struct emux_ctx, fake_dev);
+    struct block_device *lower_dev = emux->paths[LOWER_DEVICE].dmdev->bdev;
+
+    if (cmd == EMUX_IOCTL)
+        return emux_handle_ioctl(emux, (struct emux_ioctl *)arg);
+    else
+        return lower_dev->bd_disk->fops->ioctl(lower_dev, mode, cmd, arg);
+}
+
+static struct block_device_operations emux_fops = {
+    .ioctl = emux_ioctl,
+};
+
+static struct gendisk emux_fake_disk = {
+    .fops = &emux_fops,
+};
+
+static struct emux_ctx *emux_alloc_ctx(u64 page_sectors, u64 num_pages, struct switch_path *paths) {
+    u64 i;
+    struct emux_ctx *emux;
+
+    emux = vzalloc(struct_size(emux, pages, num_pages));
+    if (!emux)
+        goto err_alloc_ctx;
+
+    if (bioset_init(&emux->bioset, BIO_POOL_SIZE, 0, 0))
+        goto err_bioset_init;
+
+    emux->page_sectors = page_sectors;
+    emux->num_pages = num_pages;
+    emux->paths = paths;
+    emux->fake_dev.bd_disk = &emux_fake_disk;
+    for (i = 0; i < num_pages; i++) {
+        mutex_init(&emux->pages[i].mutex);
+        emux->pages[i].id = i;
+    }
+
+    return emux;
+
+err_bioset_init:
+    vfree(emux);
+err_alloc_ctx:
+    return NULL;
+}
+
+static void emux_free_ctx(struct emux_ctx *emux) {
+    bioset_exit(&emux->bioset);
+    vfree(emux);
+}
+
+struct emux_promotion {
+    void *old_bi_private;
+    bio_end_io_t *old_bi_end_io;
+    struct emux_ctx *emux;
+    struct emux_page *page;
+    u32 version;
+};
+
+/*
+ * One region_table_slot_t holds <region_entries_per_slot> region table
+ * entries each of which is <region_table_entry_bits> in size.
+ */
+typedef unsigned long region_table_slot_t;
 
 /*
  * Context block for a dm switch device.
@@ -176,7 +369,7 @@ static unsigned switch_region_table_read(struct switch_ctx *sctx, unsigned long 
 /*
  * Find which path to use at given offset.
  */
-static unsigned switch_get_path_nr(struct switch_ctx *sctx, sector_t offset) {
+static __always_unused unsigned switch_get_path_nr(struct switch_ctx *sctx, sector_t offset) {
     unsigned path_nr;
     sector_t p;
 
@@ -210,7 +403,7 @@ switch_region_table_write(struct switch_ctx *sctx, unsigned long region_nr, unsi
 }
 
 /*
- * Initially route all I/O to path 0
+ * Initially map all I/O to path 0
  */
 static void initialise_region_table(struct switch_ctx *sctx) {
     unsigned long region_nr;
@@ -222,11 +415,11 @@ static void initialise_region_table(struct switch_ctx *sctx) {
 
 static int parse_path(struct dm_arg_set *as, struct dm_target *ti) {
     struct switch_ctx *sctx = ti->private;
+    struct dm_dev **dev_p = &sctx->path_list[sctx->nr_paths].dmdev;
     unsigned long long start;
     int r;
 
-    r = dm_get_device(
-        ti, dm_shift_arg(as), dm_table_get_mode(ti->table), &sctx->path_list[sctx->nr_paths].dmdev);
+    r = dm_get_device(ti, dm_shift_arg(as), dm_table_get_mode(ti->table), dev_p);
     if (r) {
         ti->error = "Device lookup failed";
         return r;
@@ -234,7 +427,18 @@ static int parse_path(struct dm_arg_set *as, struct dm_target *ti) {
 
     if (kstrtoull(dm_shift_arg(as), 10, &start) || start != (sector_t)start) {
         ti->error = "Invalid device starting offset";
-        dm_put_device(ti, sctx->path_list[sctx->nr_paths].dmdev);
+        dm_put_device(ti, *dev_p);
+        return -EINVAL;
+    }
+
+    if (start != 0) {
+        ti->error = "Start sector must be zero";
+        dm_put_device(ti, *dev_p);
+        return -EINVAL;
+    }
+    if ((*dev_p)->bdev->bd_nr_sectors < ti->len) {
+        ti->error = "Block device is smaller than expected";
+        dm_put_device(ti, *dev_p);
         return -EINVAL;
     }
 
@@ -254,8 +458,9 @@ static void switch_dtr(struct dm_target *ti) {
     while (sctx->nr_paths--)
         dm_put_device(ti, sctx->path_list[sctx->nr_paths].dmdev);
 
+    emux_free_ctx(sctx->emux);
+
     vfree(sctx->region_table);
-    vfree(sctx->emux);
     kfree(sctx);
 }
 
@@ -280,9 +485,7 @@ static int switch_ctr(struct dm_target *ti, unsigned argc, char **argv) {
     struct dm_arg_set as;
     unsigned nr_paths, region_size, nr_optional_args;
     int r;
-
-    struct emux_ctx *emux;
-    u64 num_pages, i;
+    u64 num_pages;
 
     as.argc = argc;
     as.argv = argv;
@@ -290,6 +493,15 @@ static int switch_ctr(struct dm_target *ti, unsigned argc, char **argv) {
     r = dm_read_arg(_args, &as, &nr_paths, &ti->error);
     if (r)
         return -EINVAL;
+
+    if (nr_paths != 2) {
+        ti->error = "EMux needs exactly two backing devices";
+        return -EINVAL;
+    }
+    if (ti->begin != 0) {
+        ti->error = "Offset must be zero";
+        return -EINVAL;
+    }
 
     r = dm_read_arg(_args + 1, &as, &region_size, &ti->error);
     if (r)
@@ -316,20 +528,13 @@ static int switch_ctr(struct dm_target *ti, unsigned argc, char **argv) {
         goto error;
 
     num_pages = DIV_ROUND_UP(ti->len, region_size);
-    emux = vzalloc(struct_size(emux, pages, num_pages));
-    if (!emux) {
-        ti->error = "Cannot allocate emux context";
-        return -ENOMEM;
+    sctx->emux = emux_alloc_ctx(region_size, num_pages, sctx->path_list);
+    if (!sctx->emux) {
+        ti->error = "Cannot allocate EMux context";
+        r = -ENOMEM;
+        goto error;
     }
-
-    emux->page_sectors = region_size;
-    emux->num_pages = num_pages;
-    for (i = 0; i < num_pages; i++) {
-        spin_lock_init(&emux->pages[i].lock);
-    }
-
-    sctx->emux = emux;
-    DMINFO("Allocated metadata for %llu pages", emux->num_pages);
+    DMINFO("Allocated EMux context for %llu pages", num_pages);
 
     while (as.argc) {
         r = parse_path(&as, ti);
@@ -354,21 +559,170 @@ error:
     return r;
 }
 
-static int switch_map(struct dm_target *ti, struct bio *bio) {
-    struct switch_ctx *sctx = ti->private;
-    sector_t offset = dm_target_offset(ti, bio->bi_iter.bi_sector);
-    unsigned path_nr = switch_get_path_nr(sctx, offset);
+static void emux_map_bio(struct emux_ctx *emux, struct bio *bio, u64 path_id) {
+    struct switch_path *path = &emux->paths[path_id];
+    bio_set_dev(bio, path->dmdev->bdev);
+}
 
-    bio_set_dev(bio, sctx->path_list[path_nr].dmdev->bdev);
-    bio->bi_iter.bi_sector = sctx->path_list[path_nr].start + offset;
+static void emux_clone_and_map_bio(struct emux_ctx *emux, struct bio *bio) {
+    struct bio *new_bio;
 
-    // DMINFO("%s: op= 0x%x offset= 0x%llx size= 0x%x",
-    //        __func__,
-    //        bio->bi_opf,
-    //        bio->bi_iter.bi_sector * 512,
-    //        bio->bi_iter.bi_size);
+    emux_map_bio(emux, bio, LOWER_DEVICE);
+
+    new_bio = bio_alloc_clone(NULL, bio, GFP_NOIO, &emux->bioset);
+    BUG_ON(!new_bio);
+
+    emux_map_bio(emux, new_bio, UPPER_DEVICE);
+    bio_chain(new_bio, bio);
+    submit_bio(new_bio);
+}
+
+static void emux_promotion_done(struct bio *bio) {
+    bio_free_pages(bio);
+}
+
+static bool emux_start_promotion(struct emux_ctx *emux, struct bio *bio) {
+    u32 vcnt = bio_segments(bio);
+    struct bio *new_bio;
+    struct bvec_iter iter;
+    struct bio_vec bv;
+    struct page *page;
+
+    BUG_ON(bio_op(bio) != REQ_OP_READ);
+
+    new_bio = bio_alloc_bioset(NULL, vcnt, REQ_OP_WRITE, GFP_NOIO, &emux->bioset);
+    goto err_bio_alloc;
+
+    bio_for_each_segment(bv, bio, iter) {
+        page = alloc_pages(GFP_NOIO, get_order(bv.bv_len));
+        if (!page)
+            goto err_alloc_pages;
+
+        bio_add_page(bio, page, bv.bv_len, 0);
+    }
+
+    bio_copy_data(new_bio, bio);
+    emux_map_bio(emux, bio, UPPER_DEVICE);
+    new_bio->bi_end_io = emux_promotion_done;
+    submit_bio(new_bio);
+    return true;
+
+err_alloc_pages:
+    bio_free_pages(new_bio);
+    bio_put(bio);
+err_bio_alloc:
+    return false;
+}
+
+static void emux_promote(struct bio *bio) {
+    struct emux_promotion *promote = bio->bi_private;
+    struct emux_page *page = promote->page;
+
+    mutex_lock(&page->mutex);
+    if (page->version == promote->version && page->state == EMUX_PAGE_PROMOTING) {
+        if (emux_start_promotion(promote->emux, bio)) {
+            emux_set_page_state(page, EMUX_PAGE_CACHED);
+        } else {
+            // Promotion of this time is failed. Maybe the next time will succeed
+            emux_set_page_state(page, EMUX_PAGE_PENDING);
+        }
+    }
+    mutex_unlock(&page->mutex);
+
+    bio->bi_private = promote->old_bi_private;
+    bio->bi_end_io = promote->old_bi_end_io;
+    kfree(promote);
+
+    bio->bi_end_io(bio);
+}
+
+static bool
+emux_wrap_bio_with_promotion(struct emux_ctx *emux, struct bio *bio, struct emux_page *page) {
+    struct emux_promotion *promote = kzalloc(sizeof(*promote), GFP_NOIO);
+    if (!promote)
+        return false;
+
+    promote->old_bi_private = bio->bi_private;
+    promote->old_bi_end_io = bio->bi_end_io;
+    promote->emux = emux;
+    promote->page = page;
+    promote->version = page->version;
+
+    bio->bi_private = promote;
+    bio->bi_end_io = emux_promote;
+
+    return true;
+}
+
+static int
+emux_map_rw_locked(struct emux_ctx *emux, struct bio *bio, struct emux_page *page, bool write) {
+    switch (page->state) {
+        case EMUX_PAGE_UNCACHED: {
+            emux_map_bio(emux, bio, LOWER_DEVICE);
+        } break;
+
+        case EMUX_PAGE_PENDING: {
+            if (write) {
+                emux_clone_and_map_bio(emux, bio);
+                emux_set_page_state(page, EMUX_PAGE_CACHED);
+            } else {
+                emux_map_bio(emux, bio, LOWER_DEVICE);
+                if (emux_wrap_bio_with_promotion(emux, bio, page))
+                    emux_set_page_state(page, EMUX_PAGE_PROMOTING);
+            }
+        } break;
+
+        case EMUX_PAGE_PROMOTING: {
+            if (write) {
+                emux_clone_and_map_bio(emux, bio);
+                emux_set_page_state(page, EMUX_PAGE_CACHED);
+            } else {
+                emux_map_bio(emux, bio, LOWER_DEVICE);
+            }
+        } break;
+
+        case EMUX_PAGE_CACHED: {
+            if (write)
+                emux_clone_and_map_bio(emux, bio);
+            else
+                emux_map_bio(emux, bio, UPPER_DEVICE);
+        } break;
+    }
 
     return DM_MAPIO_REMAPPED;
+}
+
+static int emux_map(struct emux_ctx *emux, struct bio *bio) {
+    sector_t offset = bio->bi_iter.bi_sector;
+    u64 page_id = offset / emux->page_sectors;
+    struct emux_page *page = &emux->pages[page_id];
+    enum req_op op = bio_op(bio);
+    int ret;
+
+    DMINFO("op= %d offset= 0x%llx page #%llu", op, offset * SECTOR_SIZE, page_id);
+
+    switch (op) {
+        case REQ_OP_READ:
+        case REQ_OP_WRITE:
+        case REQ_OP_WRITE_ZEROES: {
+            mutex_lock(&page->mutex);
+            ret = emux_map_rw_locked(emux, bio, page, bio_data_dir(bio));
+            mutex_unlock(&page->mutex);
+        } break;
+
+        // All other operations are mapped to lower device
+        default: {
+            emux_map_bio(emux, bio, LOWER_DEVICE);
+            ret = DM_MAPIO_REMAPPED;
+        }
+    }
+
+    return ret;
+}
+
+static int switch_map(struct dm_target *ti, struct bio *bio) {
+    struct switch_ctx *sctx = ti->private;
+    return emux_map(sctx->emux, bio);
 }
 
 /*
@@ -554,21 +908,11 @@ static void switch_status(struct dm_target *ti,
 /*
  * Switch ioctl:
  *
- * Passthrough all ioctls to the path for sector 0
+ * Passthrough all ioctls to the fake device of EMux
  */
 static int switch_prepare_ioctl(struct dm_target *ti, struct block_device **bdev) {
     struct switch_ctx *sctx = ti->private;
-    unsigned path_nr;
-
-    path_nr = switch_get_path_nr(sctx, 0);
-
-    *bdev = sctx->path_list[path_nr].dmdev->bdev;
-
-    /*
-	 * Only pass ioctls through if the device sizes match exactly.
-	 */
-    if (ti->len + sctx->path_list[path_nr].start != bdev_nr_sectors((*bdev)))
-        return 1;
+    *bdev = &sctx->emux->fake_dev;
     return 0;
 }
 
@@ -624,5 +968,5 @@ MODULE_AUTHOR("Jim Ramsay <Jim_Ramsay@dell.com>");
 MODULE_AUTHOR("Mikulas Patocka <mpatocka@redhat.com>");
 MODULE_LICENSE("GPL");
 
-MODULE_DESCRIPTION("Elastic multiplexer (emux)");
+MODULE_DESCRIPTION("Elastic Multiplexer (EMux)");
 MODULE_AUTHOR("Xue Zhenliang <riteme@qq.com>");

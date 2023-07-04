@@ -1,6 +1,7 @@
 #!/bin/bash
 
 loop=
+dmesg_pid=
 
 clean() {
     set +e
@@ -11,10 +12,15 @@ clean() {
     sudo losetup -d $loop
 
     sudo rmmod emux
+
+    sudo kill $dmesg_pid
 }
 
 trap clean EXIT
 set -mex
+
+sudo dmesg --human --nopager --force-prefix --kernel --follow-new &
+dmesg_pid=$!
 
 make
 sudo insmod emux.ko
