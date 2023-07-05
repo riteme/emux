@@ -1,19 +1,25 @@
 obj-m += emux.o
 
+TARGETS = disk rw rand_mark
+
 READLINE_FLAGS = $(shell pkg-config --libs --cflags readline)
 
 .PHONY: all module clean
 
-all: module disk rw
+all: module $(TARGETS)
 
 module:
-	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 
 disk:
 	dd if=/dev/zero of=$@ oflag=direct bs=1M count=2048 status=progress
 
-rw: rw.cpp
-	$(CXX) $^ $(READLINE_FLAGS) -o $@
+rw: rw.cpp ioctl.h
+	$(CXX) $< $(READLINE_FLAGS) -o $@
+
+rand_mark: rand_mark.cpp ioctl.h
+	$(CXX) $< -o $@
 
 clean:
-	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+	$(RM) rw $(TARGETS)

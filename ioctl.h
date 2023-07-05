@@ -14,6 +14,6 @@ struct emux_ioctl {
     __u64 performed;
 };
 
-#define EMUX_IOCTL_MAX_COUNT 65536
+// #define EMUX_IOCTL_MAX_COUNT 65536
 
 #define EMUX_IOCTL _IOWR('E', 0, struct emux_ioctl)

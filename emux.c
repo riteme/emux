@@ -42,7 +42,7 @@ enum emux_page_state {
     EMUX_PAGE_CACHED,
 };
 
-static const char *emux_page_state_name[] = {
+static __always_unused const char *emux_page_state_name[] = {
     [EMUX_PAGE_UNCACHED] = "uncached",
     [EMUX_PAGE_PENDING] = "pending",
     [EMUX_PAGE_PROMOTING] = "promoting",
@@ -63,11 +63,11 @@ struct emux_page {
 // We use a wrapper function to ease debug logging
 static __always_inline void emux_set_page_state(struct emux_page *page,
                                                 enum emux_page_state state) {
-    DMINFO("page #%llu (v%u): \"%s\" -> \"%s\"",
-           page->id,
-           page->version,
-           emux_page_state_name[page->state],
-           emux_page_state_name[state]);
+    // DMINFO("page #%llu (v%u): \"%s\" -> \"%s\"",
+    //        page->id,
+    //        page->version,
+    //        emux_page_state_name[page->state],
+    //        emux_page_state_name[state]);
     page->__state_writable = state;
 }
 
@@ -160,8 +160,8 @@ static int emux_handle_ioctl(struct emux_ctx *emux, struct emux_ioctl *__user ua
 
         default: return -EINVAL;
     }
-    if (args.count > EMUX_IOCTL_MAX_COUNT)
-        return -EINVAL;
+    // if (args.count > EMUX_IOCTL_MAX_COUNT)
+    //     return -EINVAL;
     if (args.performed != 0)
         return -EINVAL;
 
@@ -421,8 +421,8 @@ static __always_unused void emux_print_iter(const char *name, struct bvec_iter i
 }
 
 static void emux_promotion_done(struct bio *bio) {
-    emux_print_iter(__func__, bio->bi_iter);
-    DMINFO("%s: status=%d", __func__, bio->bi_status);
+    // emux_print_iter(__func__, bio->bi_iter);
+    // DMINFO("%s: status=%d", __func__, bio->bi_status);
     bio_free_pages(bio);
 }
 
@@ -434,7 +434,7 @@ static bool _emux_start_promotion(struct emux_ctx *emux, struct bio *completed_b
     struct page *page;
 
     BUG_ON(bio_op(completed_bio) != REQ_OP_READ);
-    DMINFO("%s: vcnt= %u", __func__, vcnt);
+    // DMINFO("%s: vcnt= %u", __func__, vcnt);
 
     new_bio = bio_alloc_bioset(NULL, vcnt, REQ_OP_WRITE, GFP_NOIO, &emux->bioset);
     if (!new_bio)
@@ -445,12 +445,12 @@ static bool _emux_start_promotion(struct emux_ctx *emux, struct bio *completed_b
         if (!page)
             goto err_alloc_pages;
 
-        DMINFO("%s: bv_len=%u", __func__, bv.bv_len);
+        // DMINFO("%s: bv_len=%u", __func__, bv.bv_len);
         bio_add_page(new_bio, page, bv.bv_len, 0);
     }
 
     bio_copy_data(new_bio, completed_bio);
-    emux_print_iter("new_bio", new_bio->bi_iter);
+    // emux_print_iter("new_bio", new_bio->bi_iter);
     emux_map_bio(emux, new_bio, UPPER_DEVICE);
     new_bio->bi_iter.bi_sector = completed_bio->bi_iter.bi_sector;
     new_bio->bi_end_io = emux_promotion_done;
@@ -471,8 +471,8 @@ emux_start_promotion(struct emux_ctx *emux, struct bio *completed_bio, struct bv
 
     // We have to restore the original iterator to read the data from the completed bio
     backup_iter = completed_bio->bi_iter;
-    emux_print_iter("old", old_iter);
-    emux_print_iter("backup", backup_iter);
+    // emux_print_iter("old", old_iter);
+    // emux_print_iter("backup", backup_iter);
     old_iter.bi_size = old_iter.bi_size - backup_iter.bi_size;
     completed_bio->bi_iter = old_iter;
 
@@ -574,12 +574,12 @@ static int emux_map(struct emux_ctx *emux, struct bio *bio) {
         case REQ_OP_WRITE_ZEROES: {
             mutex_lock(&page->mutex);
 
-            DMINFO("op= %d offset= 0x%llx size=%u page #%llu \"%s\"",
-                   op,
-                   offset * SECTOR_SIZE,
-                   bio->bi_iter.bi_size,
-                   page_id,
-                   emux_page_state_name[page->state]);
+            // DMINFO("op= %d offset= 0x%llx size=%u page #%llu \"%s\"",
+            //        op,
+            //        offset * SECTOR_SIZE,
+            //        bio->bi_iter.bi_size,
+            //        page_id,
+            //        emux_page_state_name[page->state]);
 
             ret = emux_map_rw_locked(emux, bio, page, bio_data_dir(bio));
 
