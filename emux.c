@@ -68,6 +68,7 @@ static __always_inline void emux_set_page_state(struct emux_page *page,
     //        page->version,
     //        emux_page_state_name[page->state],
     //        emux_page_state_name[state]);
+
     page->__state_writable = state;
 }
 

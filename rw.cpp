@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <chrono>
 #include <sstream>
 
 #include <readline/history.h>
@@ -61,11 +62,13 @@ int main(int argc, char *argv[]) {
             auto buf = (char *)aligned_alloc(page_size, size);
             memset(buf, filler[0], size);
 
+            auto t0 = std::chrono::steady_clock::now();
             ssize_t ret;
             if (is_read)
                 ret = pread(fd, buf, size, offset);
             else
                 ret = pwrite(fd, buf, size, offset);
+            auto t = std::chrono::steady_clock::now() - t0;
 
             if (ret < 0) {
                 fprintf(stderr, "Cannot %s: errno=%d\n", op_name, errno);
@@ -73,7 +76,8 @@ int main(int argc, char *argv[]) {
             }
 
             char c = (is_read ? buf[0] : filler[0]);
-            printf("%s %zd of %zu \"%c\" (0x%x)\n", op_name, ret, size, c, c);
+            auto time_us = std::chrono::duration_cast<std::chrono::nanoseconds>(t).count() / 1000.0;
+            printf("%s %zd of %zu \"%c\" (0x%x) in %.3lf us\n", op_name, ret, size, c, c, time_us);
 
             free(buf);
         } else {
