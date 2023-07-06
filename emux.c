@@ -73,6 +73,7 @@ static __always_inline void emux_set_page_state(struct emux_page *page,
 
 struct emux_ctx {
     u64 page_sectors;  // Page size in sectors, e.g. 8 for 4k page size
+    u64 page_size;     // == page_sectors * SECTOR_SIZE
     u64 num_pages;
     struct switch_path *paths;
     struct bio_set bioset;
@@ -87,13 +88,41 @@ struct emux_ctx {
     struct emux_page pages[];
 };
 
-struct emux_promotion {
-    void *old_bi_private;
-    bio_end_io_t *old_bi_end_io;
+struct emux_saved_bio {
+    void *bi_private;
+    void *bi_end_io;
+    struct bvec_iter bi_iter;
+};
+
+static __always_inline void emux_save_bio(struct emux_saved_bio *save, struct bio *bio) {
+    save->bi_private = bio->bi_private;
+    save->bi_end_io = bio->bi_end_io;
+    save->bi_iter = bio->bi_iter;
+}
+
+struct emux_io_action {
+    bool map_to_lower : 1;
+    bool map_to_upper : 1;
+    bool promote : 1;
+    u8 version : 5;
+};
+
+#define EMUX_PAGE_VERSION_MASK ((1 << 5) - 1)
+
+static __always_inline bool emux_page_promoting(struct emux_page *page,
+                                                struct emux_io_action *action) {
+    return (page->version & EMUX_PAGE_VERSION_MASK) == action->version &&
+           page->state == EMUX_PAGE_PROMOTING;
+}
+
+struct emux_io {
     struct emux_ctx *emux;
-    struct emux_page *page;
-    u32 version;
-    struct bvec_iter old_bi_iter;
+    struct emux_saved_bio save;
+
+    u64 midpart_beg;
+    u64 midpart_end;
+    u64 start_id;
+    struct emux_io_action actions[];
 };
 
 /*
@@ -219,6 +248,7 @@ static struct emux_ctx *emux_alloc_ctx(u64 page_sectors, u64 num_pages, struct s
         goto err_bioset_init;
 
     emux->page_sectors = page_sectors;
+    emux->page_size = page_sectors * SECTOR_SIZE;
     emux->num_pages = num_pages;
     emux->paths = paths;
     emux->fake_dev.bd_disk = &emux_fake_disk;
@@ -363,9 +393,9 @@ static int switch_ctr(struct dm_target *ti, unsigned argc, char **argv) {
         return -ENOMEM;
     }
 
-    r = dm_set_target_max_io_len(ti, region_size);
-    if (r)
-        goto error;
+    // r = dm_set_target_max_io_len(ti, region_size);
+    // if (r)
+    //     goto error;
 
     num_pages = DIV_ROUND_UP(ti->len, region_size);
     sctx->emux = emux_alloc_ctx(region_size, num_pages, sctx->path_list);
@@ -398,19 +428,6 @@ static void emux_map_bio(struct emux_ctx *emux, struct bio *bio, u64 path_id) {
     bio_set_dev(bio, path->dmdev->bdev);
 }
 
-static void emux_clone_and_map_bio(struct emux_ctx *emux, struct bio *bio) {
-    struct bio *new_bio;
-
-    emux_map_bio(emux, bio, LOWER_DEVICE);
-
-    new_bio = bio_alloc_clone(NULL, bio, GFP_NOIO, &emux->bioset);
-    BUG_ON(!new_bio);
-
-    emux_map_bio(emux, new_bio, UPPER_DEVICE);
-    bio_chain(new_bio, bio);
-    submit_bio(new_bio);
-}
-
 static __always_unused void emux_print_iter(const char *name, struct bvec_iter iter) {
     DMINFO("%s={sector=%llu, size=%u, idx=%u, done=%u}",
            name,
@@ -420,153 +437,54 @@ static __always_unused void emux_print_iter(const char *name, struct bvec_iter i
            iter.bi_bvec_done);
 }
 
-static void emux_promotion_done(struct bio *bio) {
-    // emux_print_iter(__func__, bio->bi_iter);
-    // DMINFO("%s: status=%d", __func__, bio->bi_status);
-    bio_free_pages(bio);
-}
+static struct emux_io_action
+emux_map_page_locked(struct emux_ctx *emux, struct emux_page *page, bool write) {
+    struct emux_io_action ret = {};
 
-static bool _emux_start_promotion(struct emux_ctx *emux, struct bio *completed_bio) {
-    u32 vcnt = bio_segments(completed_bio);
-    struct bio *new_bio;
-    struct bvec_iter iter;
-    struct bio_vec bv;
-    struct page *page;
-
-    BUG_ON(bio_op(completed_bio) != REQ_OP_READ);
-    // DMINFO("%s: vcnt= %u", __func__, vcnt);
-
-    new_bio = bio_alloc_bioset(NULL, vcnt, REQ_OP_WRITE, GFP_NOIO, &emux->bioset);
-    if (!new_bio)
-        goto err_bio_alloc;
-
-    bio_for_each_segment(bv, completed_bio, iter) {
-        page = alloc_pages(GFP_NOIO, get_order(bv.bv_len));
-        if (!page)
-            goto err_alloc_pages;
-
-        // DMINFO("%s: bv_len=%u", __func__, bv.bv_len);
-        bio_add_page(new_bio, page, bv.bv_len, 0);
-    }
-
-    bio_copy_data(new_bio, completed_bio);
-    // emux_print_iter("new_bio", new_bio->bi_iter);
-    emux_map_bio(emux, new_bio, UPPER_DEVICE);
-    new_bio->bi_iter.bi_sector = completed_bio->bi_iter.bi_sector;
-    new_bio->bi_end_io = emux_promotion_done;
-    submit_bio(new_bio);
-    return true;
-
-err_alloc_pages:
-    bio_free_pages(new_bio);
-    bio_put(new_bio);
-err_bio_alloc:
-    return false;
-}
-
-static bool
-emux_start_promotion(struct emux_ctx *emux, struct bio *completed_bio, struct bvec_iter old_iter) {
-    struct bvec_iter backup_iter;
-    bool ret;
-
-    // We have to restore the original iterator to read the data from the completed bio
-    backup_iter = completed_bio->bi_iter;
-    // emux_print_iter("old", old_iter);
-    // emux_print_iter("backup", backup_iter);
-    old_iter.bi_size = old_iter.bi_size - backup_iter.bi_size;
-    completed_bio->bi_iter = old_iter;
-
-    ret = _emux_start_promotion(emux, completed_bio);
-
-    completed_bio->bi_iter = backup_iter;
-    return ret;
-}
-
-static void emux_promote(struct bio *completed_bio) {
-    struct emux_promotion *promote = completed_bio->bi_private;
-    struct emux_page *page = promote->page;
-
-    mutex_lock(&page->mutex);
-    if (page->version == promote->version && page->state == EMUX_PAGE_PROMOTING) {
-        if (emux_start_promotion(promote->emux, completed_bio, promote->old_bi_iter)) {
-            emux_set_page_state(page, EMUX_PAGE_CACHED);
-        } else {
-            // Promotion of this time is failed. Maybe the next time will succeed
-            emux_set_page_state(page, EMUX_PAGE_PENDING);
-        }
-    }
-    mutex_unlock(&page->mutex);
-
-    completed_bio->bi_private = promote->old_bi_private;
-    completed_bio->bi_end_io = promote->old_bi_end_io;
-    kfree(promote);
-
-    completed_bio->bi_end_io(completed_bio);
-}
-
-static bool
-emux_wrap_bio_with_promotion(struct emux_ctx *emux, struct bio *bio, struct emux_page *page) {
-    struct emux_promotion *promote = kzalloc(sizeof(*promote), GFP_NOIO);
-    if (!promote)
-        return false;
-
-    promote->old_bi_private = bio->bi_private;
-    promote->old_bi_end_io = bio->bi_end_io;
-    promote->emux = emux;
-    promote->page = page;
-    promote->version = page->version;
-    promote->old_bi_iter = bio->bi_iter;
-
-    bio->bi_private = promote;
-    bio->bi_end_io = emux_promote;
-
-    return true;
-}
-
-static int
-emux_map_rw_locked(struct emux_ctx *emux, struct bio *bio, struct emux_page *page, bool write) {
     switch (page->state) {
         case EMUX_PAGE_UNCACHED: {
-            emux_map_bio(emux, bio, LOWER_DEVICE);
+            ret.map_to_lower = true;
         } break;
 
         case EMUX_PAGE_PENDING: {
             if (write) {
-                emux_clone_and_map_bio(emux, bio);
+                ret.map_to_lower = true;
+                ret.map_to_upper = true;
                 emux_set_page_state(page, EMUX_PAGE_CACHED);
             } else {
-                emux_map_bio(emux, bio, LOWER_DEVICE);
-                if (emux_wrap_bio_with_promotion(emux, bio, page))
-                    emux_set_page_state(page, EMUX_PAGE_PROMOTING);
+                ret.map_to_lower = true;
+                ret.promote = true;
+                ret.version = page->version;
+                emux_set_page_state(page, EMUX_PAGE_PROMOTING);
             }
         } break;
 
         case EMUX_PAGE_PROMOTING: {
             if (write) {
-                emux_clone_and_map_bio(emux, bio);
+                ret.map_to_lower = true;
+                ret.map_to_upper = true;
                 emux_set_page_state(page, EMUX_PAGE_CACHED);
             } else {
-                emux_map_bio(emux, bio, LOWER_DEVICE);
+                ret.map_to_lower = true;
             }
         } break;
 
         case EMUX_PAGE_CACHED: {
-            if (write)
-                emux_clone_and_map_bio(emux, bio);
-            else
-                emux_map_bio(emux, bio, UPPER_DEVICE);
+            if (write) {
+                ret.map_to_lower = true;
+                ret.map_to_upper = true;
+            } else {
+                ret.map_to_upper = true;
+            }
         } break;
     }
 
-    return DM_MAPIO_REMAPPED;
+    return ret;
 }
 
-static int emux_map(struct emux_ctx *emux, struct bio *bio) {
-    sector_t offset = bio->bi_iter.bi_sector;
-    u64 page_id = offset / emux->page_sectors;
-    struct emux_page *page = &emux->pages[page_id];
-    enum req_op op = bio_op(bio);
-    int ret;
+static struct emux_io_action
+emux_map_page(struct emux_ctx *emux, struct emux_page *page, enum req_op op) {
+    struct emux_io_action ret = {};
 
     switch (op) {
         case REQ_OP_READ:
@@ -581,21 +499,177 @@ static int emux_map(struct emux_ctx *emux, struct bio *bio) {
             //        page_id,
             //        emux_page_state_name[page->state]);
 
-            ret = emux_map_rw_locked(emux, bio, page, bio_data_dir(bio));
+            ret = emux_map_page_locked(emux, page, (op != REQ_OP_READ));
 
             mutex_unlock(&page->mutex);
         } break;
 
         // All other operations are mapped to lower device
         default: {
-            DMINFO("unexpected op= %d offset= 0x%llx", op, offset * SECTOR_SIZE);
-
-            emux_map_bio(emux, bio, LOWER_DEVICE);
-            ret = DM_MAPIO_REMAPPED;
+            DMINFO("unexpected op= %d at page #%llu", op, page->id);
+            ret.map_to_lower = true;
         }
     }
 
     return ret;
+}
+
+static void emux_promotion_end_io(struct bio *completed_bio) {
+    bio_free_pages(completed_bio);
+}
+
+static void
+emux_promotion_iterate(struct emux_io *io, struct bio *completed_bio, struct bvec_iter iter) {
+    u64 i;
+
+    for (i = io->midpart_beg; i < io->midpart_end; i++) {
+        struct emux_page *page = io->emux->pages + io->start_id + i;
+        struct bvec_iter page_iter = {
+            .bi_sector = page->id * io->emux->page_sectors,
+            .bi_size = io->emux->page_size,
+        };
+        struct bio *new_bio;
+        struct page *buf_page;
+
+        if (!io->actions[i].promote) {
+            bio_advance_iter(completed_bio, &iter, io->emux->page_size);
+            continue;
+        }
+
+        mutex_lock(&page->mutex);
+
+        if (emux_page_promoting(page, io->actions + i)) {
+            new_bio = bio_alloc_bioset(NULL, 1, REQ_OP_WRITE, GFP_NOIO, &io->emux->bioset);
+            BUG_ON(!new_bio);
+
+            buf_page = alloc_pages(GFP_NOIO, get_order(io->emux->page_size));
+            BUG_ON(!buf_page);
+
+            bio_add_page(new_bio, buf_page, io->emux->page_size, 0);
+            new_bio->bi_iter = page_iter;
+            bio_copy_data_iter(new_bio, &page_iter, completed_bio, &iter);
+
+            new_bio->bi_end_io = emux_promotion_end_io;
+            emux_map_bio(io->emux, new_bio, UPPER_DEVICE);
+            submit_bio(new_bio);
+
+            emux_set_page_state(page, EMUX_PAGE_CACHED);
+        } else {
+            bio_advance_iter(completed_bio, &iter, io->emux->page_size);
+            emux_set_page_state(page, EMUX_PAGE_PENDING);
+        }
+
+        mutex_unlock(&page->mutex);
+    }
+}
+
+static void emux_end_io(struct bio *completed_bio) {
+    struct emux_io *io = completed_bio->bi_private;
+
+    BUG_ON(completed_bio->bi_status != BLK_STS_OK);
+
+    emux_promotion_iterate(io, completed_bio, io->save.bi_iter);
+
+    completed_bio->bi_private = io->save.bi_private;
+    completed_bio->bi_end_io = io->save.bi_end_io;
+    kfree(io);
+
+    completed_bio->bi_end_io(completed_bio);
+}
+
+static int emux_map(struct emux_ctx *emux, struct bio *bio) {
+    sector_t offset = bio->bi_iter.bi_sector;
+    u64 start_id = offset / emux->page_sectors;
+    u64 size = bio->bi_iter.bi_size;
+    u64 count = size / emux->page_size;
+    u64 beg = 0, end = count, i;
+    enum req_op op = bio_op(bio);
+    struct emux_io *io;
+    bool need_promote = false;
+
+    BUG_ON(offset % emux->page_sectors != 0 || size % emux->page_size != 0);
+
+    io = kzalloc(struct_size(io, actions, count), GFP_NOIO);
+    BUG_ON(!io);
+
+    for (i = 0; i < count; i++) {
+        io->actions[i] = emux_map_page(emux, &emux->pages[start_id + i], op);
+        need_promote |= io->actions[i].promote;
+    }
+
+    // Bio is split into at most three parts: left, middle, right
+    // left and right parts are not mapped to lower device, so they must be mapped to upper device
+    while (beg < end && !io->actions[beg].map_to_lower) {
+        beg++;
+    }
+    while (beg < end && !io->actions[end - 1].map_to_lower) {
+        end--;
+    }
+
+    // The entire bio is cached
+    if (beg >= count) {
+        emux_map_bio(emux, bio, UPPER_DEVICE);
+        goto out;
+    }
+
+    // The left part
+    if (beg > 0) {
+        struct bio *new_bio = bio_split(bio, beg * emux->page_sectors, GFP_NOIO, &emux->bioset);
+        BUG_ON(!new_bio);
+        bio_chain(new_bio, bio);
+        emux_map_bio(emux, new_bio, UPPER_DEVICE);
+        submit_bio(new_bio);
+    }
+
+    // The right part
+    if (end < count) {
+        sector_t mid_sectors = (end - beg) * emux->page_sectors;
+        sector_t right_sectors = (count - end) * emux->page_sectors;
+        struct bio *new_bio = bio_alloc_clone(NULL, bio, GFP_NOIO, &emux->bioset);
+        BUG_ON(!new_bio);
+        bio_trim(bio, 0, mid_sectors);
+        bio_trim(new_bio, mid_sectors, right_sectors);
+        bio_chain(new_bio, bio);
+        emux_map_bio(emux, new_bio, UPPER_DEVICE);
+        submit_bio(new_bio);
+    }
+
+    // Finally the middle part
+    // For write requests, map_to_lower is always true
+    // For read requests, we always map it to lower device even if map_to_upper is true, since
+    // EMux acts as a write-through cache
+    emux_map_bio(emux, bio, LOWER_DEVICE);
+
+    if (op == REQ_OP_WRITE || op == REQ_OP_WRITE_ZEROES) {
+        for (i = beg; i < end; i++) {
+            if (io->actions[i].map_to_upper) {
+                struct bio *new_bio = bio_alloc_clone(NULL, bio, GFP_NOIO, &emux->bioset);
+                BUG_ON(!new_bio);
+                bio_trim(new_bio, (i - beg) * emux->page_sectors, emux->page_sectors);
+                bio_chain(new_bio, bio);
+                emux_map_bio(emux, new_bio, UPPER_DEVICE);
+                submit_bio(new_bio);
+            }
+        }
+    }
+
+out:
+    // Install callback if promotion is needed
+    if (need_promote) {
+        io->emux = emux;
+        io->start_id = start_id;
+        io->midpart_beg = beg;
+        io->midpart_end = end;
+
+        emux_save_bio(&io->save, bio);
+        bio->bi_private = io;
+        bio->bi_end_io = emux_end_io;
+        // io will be freed in emux_end_io
+    } else {
+        kfree(io);
+    }
+
+    return DM_MAPIO_REMAPPED;
 }
 
 static int switch_map(struct dm_target *ti, struct bio *bio) {
