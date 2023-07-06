@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 
 #include "ioctl.h"
 
@@ -119,6 +120,8 @@ static __always_inline bool emux_page_promoting(struct emux_page *page,
 struct emux_io {
     struct emux_ctx *emux;
     struct emux_saved_bio save;
+    struct work_struct work;
+    struct bio *completed_bio;
 
     u64 midpart_beg;
     u64 midpart_end;
@@ -564,8 +567,9 @@ emux_promotion_iterate(struct emux_io *io, struct bio *completed_bio, struct bve
     }
 }
 
-static void emux_end_io(struct bio *completed_bio) {
-    struct emux_io *io = completed_bio->bi_private;
+static void emux_end_io_handler(struct work_struct *work) {
+    struct emux_io *io = container_of(work, struct emux_io, work);
+    struct bio *completed_bio = io->completed_bio;
 
     BUG_ON(completed_bio->bi_status != BLK_STS_OK);
 
@@ -573,9 +577,17 @@ static void emux_end_io(struct bio *completed_bio) {
 
     completed_bio->bi_private = io->save.bi_private;
     completed_bio->bi_end_io = io->save.bi_end_io;
-    kfree(io);
 
-    completed_bio->bi_end_io(completed_bio);
+    if (completed_bio->bi_end_io)
+        completed_bio->bi_end_io(completed_bio);
+
+    bio_put(completed_bio);
+    kfree(io);
+}
+
+static void emux_end_io(struct bio *completed_bio) {
+    struct emux_io *io = completed_bio->bi_private;
+    schedule_work(&io->work);
 }
 
 static int emux_map(struct emux_ctx *emux, struct bio *bio) {
@@ -665,7 +677,12 @@ out:
         emux_save_bio(&io->save, bio);
         bio->bi_private = io;
         bio->bi_end_io = emux_end_io;
-        // io will be freed in emux_end_io
+
+        bio_get(bio);  // To be put in emux_end_io_handler
+        io->completed_bio = bio;
+        INIT_WORK(&io->work, emux_end_io_handler);
+
+        // io will be freed in emux_end_io_handler
     } else {
         kfree(io);
     }
