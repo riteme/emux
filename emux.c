@@ -654,15 +654,29 @@ static int emux_map(struct emux_ctx *emux, struct bio *bio) {
     emux_map_bio(emux, bio, LOWER_DEVICE);
 
     if (op == REQ_OP_WRITE || op == REQ_OP_WRITE_ZEROES) {
+        u64 last = -1;
         for (i = beg; i < end; i++) {
-            if (io->actions[i].map_to_upper) {
-                struct bio *new_bio = bio_alloc_clone(NULL, bio, GFP_NOIO, &emux->bioset);
-                BUG_ON(!new_bio);
-                bio_trim(new_bio, (i - beg) * emux->page_sectors, emux->page_sectors);
-                bio_chain(new_bio, bio);
-                emux_map_bio(emux, new_bio, UPPER_DEVICE);
-                submit_bio(new_bio);
-            }
+            struct bio *new_bio;
+
+            if (!io->actions[i].map_to_upper)
+                continue;
+
+            // Record the start of a coalesced bio
+            if (last == -1)
+                last = i;
+
+            // Test if we can coalesce the current bio with the next one
+            if (i + 1 < end && io->actions[i + 1].map_to_upper)
+                continue;
+
+            new_bio = bio_alloc_clone(NULL, bio, GFP_NOIO, &emux->bioset);
+            BUG_ON(!new_bio);
+            bio_trim(
+                new_bio, (last - beg) * emux->page_sectors, (i - last + 1) * emux->page_sectors);
+            bio_chain(new_bio, bio);
+            emux_map_bio(emux, new_bio, UPPER_DEVICE);
+            submit_bio(new_bio);
+            last = -1;
         }
     }
 
